@@ -9,87 +9,142 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
 
+    env:
+      # NOTE: DEPLOY_PATH is expected to be defined as a repository VARIABLE (Settings → Secrets and variables → Variables).
+      # If you stored DEPLOY_PATH as a secret instead, change the references ${ { vars.DEPLOY_PATH } } -> ${ { secrets.DEPLOY_PATH } } below.
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
-      - name: Setup PHP
+      - name: Setup PHP (with Composer)
         uses: shivammathur/setup-php@v3
         with:
           php-version: '8.1'
           extensions: mbstring, pdo, pdo_mysql, openssl
           tools: composer:v2
 
-      - name: Install Composer dependencies
-        run: |
-          composer install --no-dev --optimize-autoloader
+      - name: Install Composer dependencies (local)
+        run: composer install --no-dev --optimize-autoloader
 
       - name: Setup Node.js and build assets
         uses: actions/setup-node@v4
         with:
           node-version: '18'
-      - run: |
+      - name: Build frontend assets
+        run: |
           npm ci
           npm run build
 
-      - name: Prepare release folder (mirror repo)
+      - name: Prepare release folder (mirror repo, exclude heavy dirs)
+        shell: pwsh
         run: |
-          if (Test-Path release) { Remove-Item release -Recurse -Force }
-          New-Item -ItemType Directory -Path release
-          robocopy .\ .\release /MIR /XD node_modules .git storage vendor
-          # run composer in the release folder to ensure vendor exists
-          composer install --no-dev --optimize-autoloader --working-dir=release
+          $release = "$PWD\release"
+          if (Test-Path $release) { Remove-Item $release -Recurse -Force }
+          New-Item -ItemType Directory -Path $release | Out-Null
+          # Mirror repo into release but exclude node_modules, vendor, .git, storage
+          robocopy $PWD $release /MIR /XF package-lock.json yarn.lock /XD .git node_modules vendor storage
+          # Ensure vendor exists in release
+          composer install --no-dev --optimize-autoloader --working-dir=$release
 
-      - name: Write private key to runner (DEPLOY_KEY)
+      - name: Write deploy private key to runner
         shell: pwsh
         env:
           DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
         run: |
-          $keyPath = "$env:USERPROFILE\deploy_key"
-          # write key exactly as stored in the secret
+          if (-not $env:DEPLOY_KEY) {
+            Write-Error "DEPLOY_KEY secret is not set!"
+            exit 1
+          }
+          $keyPath = Join-Path $env:RUNNER_TEMP "deploy_key.pem"
           Set-Content -Path $keyPath -Value $env:DEPLOY_KEY -NoNewline
-          # ensure file has no Windows newlines issues (optional)
-          # set minimal permissions - Windows handles differently than Unix
-          icacls $keyPath /inheritance:r
-          icacls $keyPath /grant:r "$($env:USERNAME):(R)"
-          Write-Host "Deploy key written to $keyPath"
+          # Remove inherited permissions (best-effort on runner)
+          icacls $keyPath /inheritance:r | Out-Null
+          icacls $keyPath /grant "$($env:USERNAME):(R)" | Out-Null
+          Write-Host "Private key written to $keyPath"
+          # Expose path as output for next step
+          Write-Output "KEYPATH=$keyPath" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Upload files via scp (native OpenSSH client)
+      - name: Upload release to remote staging via scp (native OpenSSH)
         shell: pwsh
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
           USER: ${{ secrets.DEPLOY_USER }}
-          KEYPATH: "$env:USERPROFILE\deploy_key"
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          KEYPATH: ${{ runner.temp }}/deploy_key.pem
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
         run: |
-          # Ensure OpenSSH scp exists on the runner (windows-latest normally has it)
+          # check scp exists
           if (-not (Get-Command scp -ErrorAction SilentlyContinue)) {
-            Write-Error "scp not found on runner"
+            Write-Error "scp not available on runner. Consider using WinSCP action instead."
             exit 1
           }
-          # Create target dir on remote (via ssh)
-          & ssh -i $env:KEYPATH -o StrictHostKeyChecking=no $env:USER@$env:HOST "if (-not (Test-Path '$env:DEPLOY_PATH')) { New-Item -ItemType Directory -Path '$env:DEPLOY_PATH' }"
-          # Copy release content recursively
-          # NOTE: use forward-slash destination path for SFTP compatibility
-          & scp -i $env:KEYPATH -r .\release\* $env:USER@$env:HOST:"/$(($env:DEPLOY_PATH) -replace ':','' -replace '\\','/')/"
 
-      - name: Remote deploy commands via appleboy/ssh-action
+          # compute remote sftp-style path for staging: convert "C:\apps\mon-laravel-live" -> "/C/apps/mon-laravel-live_staging/"
+          $stagingWindows = "${{ vars.DEPLOY_PATH }}_staging"
+          $sftpPath = ($stagingWindows -replace ':','' -replace '\\','/')
+          $remoteTarget = "/" + $sftpPath + "/"
+
+          Write-Host "Uploading to remote: $remoteTarget"
+
+          # create remote staging parent path (via ssh)
+          & ssh -i $env:KEYPATH -o StrictHostKeyChecking=no $env:USER@$env:HOST "if (-not (Test-Path '$stagingWindows')) { New-Item -ItemType Directory -Path '$stagingWindows' }"
+
+          # copy files (use -r to copy recursively)
+          # note: scp from Windows runner requires proper quoting; use Start-Process to show better args
+          $localRelease = Join-Path $PWD "release\*"
+          & scp -i $env:KEYPATH -r $localRelease "$env:USER@$env:HOST:`"$remoteTarget`""
+
+      - name: Remote deploy (run composer, artisan, swap directories, permissions)
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_KEY }}
           script: |
-            $staging = '${{ secrets.DEPLOY_PATH }}'
-            $live = 'C:\apps\mon-laravel-live'
-            Write-Output "Running remote Laravel maintenance..."
+            # Define staging and live paths (PowerShell)
+            $staging = '${{ vars.DEPLOY_PATH }}_staging'
+            $live = '${{ vars.DEPLOY_PATH }}'
+            Write-Output "Staging = $staging"
+            Write-Output "Live = $live"
+
+            # Ensure we are in the staging directory
             cd $staging
+
+            # Install composer dependencies on the server (if composer available)
+            if (Get-Command composer -ErrorAction SilentlyContinue) {
+              composer install --no-dev --optimize-autoloader
+            } else {
+              Write-Output "Composer not found on server; ensure vendor folder was uploaded or install composer on server."
+            }
+
+            # Laravel maintenance tasks
             php artisan migrate --force
             php artisan config:cache
             php artisan route:cache
+            php artisan view:cache
 
-            # swap directories (rename live to timestamped backup)
+            # Swap staging -> live (backup old live with timestamp)
             if (Test-Path $live) {
-              Rename-Item $live ($live + "_old_" + (Get-Date -Format yyyyMMddHHmmss))
+              $backup = $live + "_old_" + (Get-Date -Format yyyyMMddHHmmss)
+              Rename-Item $live $backup
+              Write-Output "Existing live site moved to $backup"
             }
+
             Rename-Item $staging $live
+            Write-Output "Staging renamed to live."
+
+            # Fix windows permissions for Laravel storage and bootstrap cache
+            icacls "$live\storage" /grant "hp:(OI)(CI)(M)" /T
+            icacls "$live\bootstrap\cache" /grant "hp:(OI)(CI)(M)" /T
+            Write-Output "Permissions updated."
+
+      - name: Cleanup local release folder
+        if: always()
+        run: |
+          if (Test-Path release) { Remove-Item release -Recurse -Force }
+
+      - name: Done
+        run: echo "Deployment finished."
