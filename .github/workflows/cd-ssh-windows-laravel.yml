@@ -1,0 +1,95 @@
+name: CD (SSH) — Laravel -> Windows
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-and-deploy:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v3
+        with:
+          php-version: '8.1'
+          extensions: mbstring, pdo, pdo_mysql, openssl
+          tools: composer:v2
+
+      - name: Install Composer dependencies
+        run: |
+          composer install --no-dev --optimize-autoloader
+
+      - name: Setup Node.js and build assets
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      - run: |
+          npm ci
+          npm run build
+
+      - name: Prepare release folder (mirror repo)
+        run: |
+          if (Test-Path release) { Remove-Item release -Recurse -Force }
+          New-Item -ItemType Directory -Path release
+          robocopy .\ .\release /MIR /XD node_modules .git storage vendor
+          # run composer in the release folder to ensure vendor exists
+          composer install --no-dev --optimize-autoloader --working-dir=release
+
+      - name: Write private key to runner (DEPLOY_KEY)
+        shell: pwsh
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          $keyPath = "$env:USERPROFILE\deploy_key"
+          # write key exactly as stored in the secret
+          Set-Content -Path $keyPath -Value $env:DEPLOY_KEY -NoNewline
+          # ensure file has no Windows newlines issues (optional)
+          # set minimal permissions - Windows handles differently than Unix
+          icacls $keyPath /inheritance:r
+          icacls $keyPath /grant:r "$($env:USERNAME):(R)"
+          Write-Host "Deploy key written to $keyPath"
+
+      - name: Upload files via scp (native OpenSSH client)
+        shell: pwsh
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          KEYPATH: "$env:USERPROFILE\deploy_key"
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          # Ensure OpenSSH scp exists on the runner (windows-latest normally has it)
+          if (-not (Get-Command scp -ErrorAction SilentlyContinue)) {
+            Write-Error "scp not found on runner"
+            exit 1
+          }
+          # Create target dir on remote (via ssh)
+          & ssh -i $env:KEYPATH -o StrictHostKeyChecking=no $env:USER@$env:HOST "if (-not (Test-Path '$env:DEPLOY_PATH')) { New-Item -ItemType Directory -Path '$env:DEPLOY_PATH' }"
+          # Copy release content recursively
+          # NOTE: use forward-slash destination path for SFTP compatibility
+          & scp -i $env:KEYPATH -r .\release\* $env:USER@$env:HOST:"/$(($env:DEPLOY_PATH) -replace ':','' -replace '\\','/')/"
+
+      - name: Remote deploy commands via appleboy/ssh-action
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          script: |
+            $staging = '${{ secrets.DEPLOY_PATH }}'
+            $live = 'C:\apps\mon-laravel-live'
+            Write-Output "Running remote Laravel maintenance..."
+            cd $staging
+            php artisan migrate --force
+            php artisan config:cache
+            php artisan route:cache
+
+            # swap directories (rename live to timestamped backup)
+            if (Test-Path $live) {
+              Rename-Item $live ($live + "_old_" + (Get-Date -Format yyyyMMddHHmmss))
+            }
+            Rename-Item $staging $live
